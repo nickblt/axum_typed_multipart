@@ -1,5 +1,8 @@
 use crate::case_conversion::RenameCase;
-use crate::util::{matches_option_signature, matches_vec_signature, strip_leading_rawlit};
+use crate::util::{
+    extract_value_type_from_hashmap, matches_hashmap_signature, matches_option_signature,
+    matches_vec_signature, strip_leading_rawlit,
+};
 use darling::{FromDeriveInput, FromField};
 use proc_macro::TokenStream;
 use proc_macro_error::abort;
@@ -36,6 +39,9 @@ struct FieldData {
 
     #[darling(default)]
     default: bool,
+
+    #[darling(default)]
+    unknown_fields_map: bool,
 }
 
 impl FieldData {
@@ -81,13 +87,19 @@ pub fn macro_impl(input: TokenStream) -> TokenStream {
 
     let fields = data.take_struct().unwrap();
 
-    let declarations = fields.iter().map(|FieldData { ident, ty, default, .. }| {
+    let declarations = fields.iter().map(|FieldData { ident, ty, default, unknown_fields_map, .. }| {
          if matches_vec_signature(ty) {
             quote! { let mut #ident: #ty = std::vec::Vec::new(); }
         } else if matches_option_signature(ty) {
             quote! { let mut #ident: #ty = std::option::Option::None; }
         } else if *default {
             quote! { let mut #ident: std::option::Option<#ty> = std::option::Option::Some(#ty::default()); }
+        } else if *unknown_fields_map {
+            if !matches_hashmap_signature(ty) {
+                abort!(ident, "Unknown type for unknown_fields_map. unknown_fields_map must be a HashMap with a supported value type");
+            }
+
+            quote! { let mut #ident: #ty = HashMap::new(); }
         } else {
             quote! { let mut #ident: std::option::Option<#ty> = std::option::Option::None; }
         }
@@ -95,6 +107,7 @@ pub fn macro_impl(input: TokenStream) -> TokenStream {
 
     let mut assignments = fields
         .iter()
+        .filter(|FieldData { unknown_fields_map, .. }| !*unknown_fields_map)
         .map(|field @ FieldData { ident, ty, .. }| {
             let name = field.name(rename_all);
             let limit_bytes =
@@ -141,9 +154,35 @@ pub fn macro_impl(input: TokenStream) -> TokenStream {
         })
     }
 
-    let required_fields = fields
-        .iter()
-        .filter(|FieldData { ty, .. }| !matches_option_signature(ty) && !matches_vec_signature(ty));
+    // find the collect_unknown_fields field and add it to the unknown_fields map
+    if let Some(found_field) =
+        fields.iter().find(|FieldData { unknown_fields_map, .. }| *unknown_fields_map)
+    {
+        let ident = found_field.ident.as_ref().unwrap();
+
+        let value_type = extract_value_type_from_hashmap(&found_field.ty);
+        let limit_bytes = found_field
+            .limit_bytes()
+            .map(|limit| quote! { Some(#limit) })
+            .unwrap_or(quote! { None });
+
+        assignments.push(quote! {
+            {
+                let value: #value_type  = Some(
+                    axum_typed_multipart::TryFromField::try_from_field(
+                        __field__,
+                        #limit_bytes,
+                    )
+                    .await?,
+                );
+                #ident.insert(__field_name__, value);
+            }
+        });
+    }
+
+    let required_fields = fields.iter().filter(|FieldData { ty, unknown_fields_map, .. }| {
+        !*unknown_fields_map && !matches_option_signature(ty) && !matches_vec_signature(ty)
+    });
 
     let checks = required_fields.map(|field @ FieldData { ident, .. }| {
         let field_name = field.name(rename_all);
